@@ -28,7 +28,7 @@ This [project](https://github.com/mdenisov/feeder) is forked from [Bmdenisov](ht
 
 Feeder settings are available on the device web page `http://pet-feeder.local/`.
 
-![final](docs/web.png)
+![final](docs/SCR-20241122-mhbr.png)
 
 ## Lessons Learned
 
@@ -180,6 +180,8 @@ Final
 ### ESPHome
 
 1. [Install ESPHome](https://esphome.io/guides/installing_esphome.html)
-2. Run `esphome run feeder.yaml`## License
+2. Run `esphome run feeder.yaml`
+
+## License
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
