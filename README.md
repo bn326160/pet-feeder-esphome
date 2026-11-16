@@ -21,12 +21,35 @@ This [project](https://github.com/mdenisov/feeder) is forked from [Bmdenisov](ht
 - [x] Keep track of last fed moment
 - [x] Reverse motor to clear blocked kibble
 - [x] Estimate remaining kibble
-- [ ] Skip schedule if fed manually
+- [x] Schedule editable from the web page (weekday + weekend slots, portions per slot)
+- [x] On/off switch per slot plus a master "Schedule enabled" switch, all kept across reboots
+- [x] Daily portion limit for scheduled feeds (default 7 × 10 g = 70 g)
+- [x] Separate "Feed" (counted) and "Test feed" (not counted) actions
+- [x] Low kibble warning (sensor + LED double blink, threshold editable, default 200 g)
+- [x] Fixed IP per Wi-Fi network, ready for a second (IoT) network
 - [ ] ...
 
 ### Web Server
 
-Feeder settings are available on the device web page `http://pet-feeder.local/`.
+Feeder settings are available on the device web page `http://pet-feeder.local/` (or `http://<fixed IP>/`).
+
+- **Feeding**: `Feed` dispenses one portion and counts it (portions today, kibble loaded, last fed). `Test feed` runs the same motion without counting — use it for testing or clearing a jam when the kibble goes back in the top.
+- **Schedule on/off**: a master `Schedule enabled` switch (pause everything, e.g. on holiday — manual feeding still works) and a switch per slot. `Weekday plan` / `Weekend plan` show the whole schedule on one line, e.g. `07:15 ×2 · 11:30 ×1 · 15:30 off · …`.
+- **Weekday / Weekend times**: 5 weekday (Mon–Fri) and 5 weekend (Sat–Sun) slots, each with a time and a number of portions. These groups start folded; click a group header to open or close it (remembered per browser).
+- **Daily portion limit** (1–10, default 7): scheduled feeds never go above it (a slot that would exceed it feeds what is left, or is skipped). Manual `Feed` always works; `Test feed` never counts. One portion is 10 g. `Portions today` is a read-only counter that resets at midnight; it can go above the limit when you feed manually.
+- **Persistence**: switches, times, portions, counters and last fed are written to flash within 5 seconds of a change and restored after a reboot or power loss. On the ESP8266, saved values are stored by position, so a firmware update that adds or removes saved entities can reset some of them to their defaults — check the schedule after such an update.
+- **Kibble low**: turns on below the threshold; the status LED switches from a slow pulse to a double blink.
+
+### Touch button
+
+- Double tap: feed one portion (counted)
+- Hold for 2 seconds: test feed (not counted)
+
+### Network
+
+The feeder uses a fixed IP set in `esphome/secrets.yaml` (`feeder_home_ip`, `home_gateway`, `home_subnet`); pick an address outside your router's DHCP pool. A second network (e.g. an IoT VLAN) is prepared but commented out in `feeder.yaml`.
+
+If the feeder can't join any configured network it starts the **Pet Feeder Fallback Hotspot**. Connect to it and open `http://192.168.4.1` to enter Wi-Fi credentials, then flash the firmware with your `secrets.yaml` as soon as it is on your network.
 
 ![final](docs/SCR-20241122-mhbr.png)
 
@@ -179,8 +202,11 @@ Final
 
 ### ESPHome
 
-1. [Install ESPHome](https://esphome.io/guides/installing_esphome.html)
-2. Run `esphome run feeder.yaml`
+1. [Install ESPHome](https://esphome.io/guides/installing_esphome.html) (e.g. `uv tool install esphome`)
+2. Copy `esphome/secrets.yaml.example` to `esphome/secrets.yaml` and fill it in
+3. Validate: `esphome config esphome/feeder.yaml`
+4. First flash over USB/serial: `esphome run esphome/feeder.yaml`
+5. Later updates over Wi-Fi: `esphome run esphome/feeder.yaml --device <fixed IP>` (use the current IP if it is still on DHCP)
 
 ## License
 

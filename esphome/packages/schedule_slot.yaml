@@ -1,0 +1,66 @@
+# One feeding slot: an on/off switch, a time and a number of portions.
+# Everything is restored after a reboot or power loss.
+# Included from feeder.yaml once per slot with these vars:
+#   slot_id, slot_name, default_time, default_portions,
+#   days_condition (C++ expression over `d`, ESPHome day_of_week: 1=Sun … 7=Sat),
+#   group (collapsible editor group), weight (single digit: time sorts as <w>0,
+#   portions as <w>1), toggle_weight (order in the "Schedule on/off" group)
+switch:
+  - platform: template
+    id: ${slot_id}_enabled
+    name: "${slot_name}"
+    icon: "mdi:calendar-clock"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: grp_toggles
+      sorting_weight: ${toggle_weight}
+
+datetime:
+  - platform: template
+    id: ${slot_id}_time
+    name: "${slot_name} time"
+    icon: "mdi:clock-outline"
+    type: time
+    optimistic: true
+    restore_value: true
+    initial_value: "${default_time}"
+    time_id: sntp_time
+    web_server:
+      sorting_group_id: ${group}
+      sorting_weight: ${weight}0
+    on_time:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                const int d = id(sntp_time).now().day_of_week;
+                return (${days_condition}) && id(schedule_enabled).state &&
+                       id(${slot_id}_enabled).state && id(${slot_id}_portions).state > 0;
+            then:
+              - lambda: |-
+                  // Respect the daily limit: feed what is left, skip if nothing is.
+                  const int want = (int) id(${slot_id}_portions).state;
+                  const int left = (int) id(daily_limit).state - id(portions_fed_today);
+                  const int give = std::min(want, std::max(0, left));
+                  if (give < want)
+                    ESP_LOGW("schedule", "${slot_name}: daily limit reached, feeding %d of %d", give, want);
+                  else
+                    ESP_LOGI("schedule", "${slot_name}: feeding %d portion(s)", give);
+                  if (give > 0) id(feed_portions).execute(give, true);
+
+number:
+  - platform: template
+    id: ${slot_id}_portions
+    name: "${slot_name} portions"
+    icon: "mdi:food-drumstick-outline"
+    optimistic: true
+    min_value: 0
+    max_value: 3
+    step: 1
+    mode: box
+    restore_value: true
+    initial_value: ${default_portions}
+    web_server:
+      sorting_group_id: ${group}
+      sorting_weight: ${weight}1

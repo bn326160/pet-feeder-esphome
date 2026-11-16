@@ -1,33 +1,95 @@
+# === Constants ===
+substitutions:
+  portion_grams: "10"       # weight of one portion in g (7 portions = 70 g/day)
+  motor_steps: "200"        # NEMA 17, 1.8° per step
+  micro_steps: "16"         # MS1-MS3 all HIGH on the PCB
+  gear_ratio: "5.16"        # reductor
+  weekday: "d >= 2 && d <= 6"   # ESPHome day_of_week: 1=Sun … 7=Sat
+  weekend: "d == 1 || d == 7"
+
 # === ESPHome ===
 esphome:
   name: pet-feeder
-  platform: ESP8266
-  board: esp12e
+  friendly_name: Pet Feeder
+  includes:
+    - plan_summary.h
   on_boot:
     priority: -100
     then:
-      - light.turn_on: 
-          id: status_led
-          effect: "Asymmetrical Pulse"
+      - script.execute: set_idle_led
+
+esp8266:
+  board: esp12e
+  # Keep portions, kibble, schedule and last-fed across power loss.
+  # Writes are batched (once per minute at most) and only on change.
+  restore_from_flash: true
+
+preferences:
+  # Write changed settings to flash within 5 s (default 1 min), so an edit
+  # survives even if the power is pulled right after. Only writes on change.
+  flash_write_interval: 5s
+
 logger:
-  level: DEBUG
+  level: INFO
+
 api:
-  password: ""
+  # No Home Assistant yet: never reboot because no API client is connected
+  # (the default reboots every 15 min).
+  reboot_timeout: 0s
+
 ota:
   - platform: esphome
-    password: ""
+  - platform: web_server
+
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
+  networks:
+    # Home network, fixed IP outside the router's DHCP pool.
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      priority: 1
+      manual_ip:
+        static_ip: !secret feeder_home_ip
+        gateway: !secret home_gateway
+        subnet: !secret home_subnet
+        dns1: !secret home_gateway
+    # Future IoT VLAN: uncomment once it exists (and add the keys to secrets.yaml).
+    # Higher priority = preferred when both are in range.
+    # - ssid: !secret iot_wifi_ssid
+    #   password: !secret iot_wifi_password
+    #   priority: 2
+    #   manual_ip:
+    #     static_ip: !secret feeder_iot_ip
+    #     gateway: !secret iot_gateway
+    #     subnet: !secret iot_subnet
+    #     dns1: !secret iot_gateway
   ap:
     ssid: "Pet Feeder Fallback Hotspot"
     password: "yELlzkBPI0Mh"
 captive_portal:
 
-
 web_server:
   port: 80
-  ota: true
+  version: 3
+  js_include: "web/collapsible.js"   # click a group header to fold it
+  sorting_groups:
+    - id: grp_feeding
+      name: "Feeding"
+      sorting_weight: 10
+    - id: grp_toggles
+      name: "Schedule on/off"
+      sorting_weight: 20
+    - id: grp_weekday
+      name: "Weekday times (Mon–Fri)"
+      sorting_weight: 30
+    - id: grp_weekend
+      name: "Weekend times (Sat–Sun)"
+      sorting_weight: 40
+    - id: grp_diag
+      name: "Diagnostics"
+      sorting_weight: 50
+
+debug:
+  update_interval: 60s
 
 # === Hardware ===
 stepper:
@@ -40,28 +102,46 @@ stepper:
       inverted: yes
     max_speed: 2300 steps/s
     # acceleration: 3500 steps/s^2
+
 output:
   - platform: esp8266_pwm
     pin: GPIO13
     id: led_output
+
 light:
   - platform: monochromatic
     output: led_output
     id: status_led
     name: "Status LED"
+    web_server:
+      sorting_group_id: grp_diag
     effects:
       - pulse:
-          name: "Fast Pulse"
+          name: "Fast Pulse"            # feeding
           transition_length: 0.5s
           update_interval: 0.5s
           min_brightness: 0%
           max_brightness: 100%
       - pulse:
-          name: "Asymmetrical Pulse"
+          name: "Asymmetrical Pulse"    # idle, all good
           transition_length:
             on_length: 1s
             off_length: 500ms
           update_interval: 1.5s
+      - strobe:
+          name: "Low Kibble Blink"      # idle, kibble low: double blink
+          colors:
+            - state: true
+              brightness: 100%
+              duration: 150ms
+            - state: false
+              duration: 150ms
+            - state: true
+              brightness: 100%
+              duration: 150ms
+            - state: false
+              duration: 1550ms
+
 binary_sensor:
   - platform: gpio
     id: touch_button
@@ -70,162 +150,327 @@ binary_sensor:
       mode:
         input: true
         pullup: true
-    on_double_click:
-      then:
-        - button.press: feed
+    on_multi_click:
+      # Double tap: real feed (counts toward portions / kibble)
+      - timing:
+          - ON for at most 0.5s
+          - OFF for at most 0.5s
+          - ON for at most 0.5s
+          - OFF for at least 0.2s
+        then:
+          - script.execute:
+              id: feed_portions
+              portions: 1
+              counted: true
+      # Long press: test feed (counts nothing; kibble goes back in the top)
+      - timing:
+          - ON for at least 2s
+        then:
+          - script.execute:
+              id: feed_portions
+              portions: 1
+              counted: false
 
-# === Features and Logic ===
+  - platform: template
+    id: kibble_low
+    name: "Kibble low"
+    device_class: problem
+    web_server:
+      sorting_group_id: grp_feeding
+      sorting_weight: 40
+    lambda: return id(kibble_stock).state < id(kibble_low_threshold).state;
+    on_state:
+      - if:
+          condition:
+            not:
+              script.is_running: feed_portions
+          then:
+            - script.execute: set_idle_led
+
+# === State ===
 globals:
-  - id: stepper_steps
+  - id: last_fed_ts           # epoch of the last counted feed, 0 = never
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: portions_fed_today    # counted portions since midnight (manual feeds can exceed the limit)
     type: int
-    initial_value: '200'
-  - id: stepper_micro_steps
-    type: int
-    initial_value: '16'
-  - id: stepper_gear_ratio
-    type: float
-    initial_value: '5.16'
+    restore_value: true
+    initial_value: '0'
 
 number:
   - platform: template
-    name: "Portions today"
-    id: portions_today
-    optimistic: true
-    min_value: 0
-    max_value: 7
-    step: 1
-    restore_value: true
-    initial_value: 0
-  - platform: template
     name: "Kibble loaded"
     id: kibble_stock
+    icon: "mdi:weight-gram"
+    unit_of_measurement: g
     optimistic: true
     min_value: 0
     max_value: 1000
-    step: 10.6 # Portion weight in g
+    step: ${portion_grams}
     restore_value: true
     initial_value: 0.0
+    web_server:
+      sorting_group_id: grp_feeding
+      sorting_weight: 30
+  - platform: template
+    name: "Daily portion limit"
+    id: daily_limit
+    icon: "mdi:scale-balance"
+    optimistic: true
+    min_value: 1
+    max_value: 10
+    step: 1
+    mode: box
+    restore_value: true
+    initial_value: 7
+    web_server:
+      sorting_group_id: grp_feeding
+      sorting_weight: 22
+  - platform: template
+    name: "Kibble low threshold"
+    id: kibble_low_threshold
+    icon: "mdi:alert-outline"
+    unit_of_measurement: g
+    optimistic: true
+    min_value: 0
+    max_value: 1000
+    step: 10
+    mode: box
+    restore_value: true
+    initial_value: 200
+    web_server:
+      sorting_group_id: grp_feeding
+      sorting_weight: 50
 
 text_sensor:
   - platform: template
     name: "Last fed"
     id: last_fed
+    icon: "mdi:clock-check-outline"
+    web_server:
+      sorting_group_id: grp_feeding
+      sorting_weight: 25
+  # Read-only overview of each schedule, visible while the editors are folded.
+  - platform: template
+    name: "Weekday plan"
+    id: weekday_plan
+    icon: "mdi:calendar-week"
+    update_interval: 5s
+    lambda: |-
+      return plan_summary({
+        {id(wd1_time), id(wd1_portions), id(wd1_enabled)},
+        {id(wd2_time), id(wd2_portions), id(wd2_enabled)},
+        {id(wd3_time), id(wd3_portions), id(wd3_enabled)},
+        {id(wd4_time), id(wd4_portions), id(wd4_enabled)},
+        {id(wd5_time), id(wd5_portions), id(wd5_enabled)},
+      }, id(schedule_enabled)->state);
+    web_server:
+      sorting_group_id: grp_toggles
+      sorting_weight: 1
+  - platform: template
+    name: "Weekend plan"
+    id: weekend_plan
+    icon: "mdi:calendar-weekend"
+    update_interval: 5s
+    lambda: |-
+      return plan_summary({
+        {id(we1_time), id(we1_portions), id(we1_enabled)},
+        {id(we2_time), id(we2_portions), id(we2_enabled)},
+        {id(we3_time), id(we3_portions), id(we3_enabled)},
+        {id(we4_time), id(we4_portions), id(we4_enabled)},
+        {id(we5_time), id(we5_portions), id(we5_enabled)},
+      }, id(schedule_enabled)->state);
+    web_server:
+      sorting_group_id: grp_toggles
+      sorting_weight: 2
+  - platform: wifi_info
+    ip_address:
+      name: "IP address"
+      web_server:
+        sorting_group_id: grp_diag
+    ssid:
+      name: "Connected SSID"
+      web_server:
+        sorting_group_id: grp_diag
+
+sensor:
+  # Read-only counter (was an editable slider).
+  - platform: template
+    name: "Portions today"
+    id: portions_today
+    icon: "mdi:counter"
+    unit_of_measurement: "portions"
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: return id(portions_fed_today);
+    web_server:
+      sorting_group_id: grp_feeding
+      sorting_weight: 20
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
+    web_server:
+      sorting_group_id: grp_diag
+  - platform: uptime
+    name: "Uptime"
+    web_server:
+      sorting_group_id: grp_diag
+  - platform: debug
+    free:
+      name: "Free heap"
+      web_server:
+        sorting_group_id: grp_diag
+
+switch:
+  # Master switch: pauses all scheduled feeds (manual feeding still works).
+  - platform: template
+    id: schedule_enabled
+    name: "Schedule enabled"
+    icon: "mdi:calendar-check"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: grp_toggles
+      sorting_weight: 5
 
 # === Feed ===
 button:
   - platform: template
     id: feed
-    name: Feed
+    name: "Feed"
     icon: "mdi:food-drumstick"
+    web_server:
+      sorting_group_id: grp_feeding
+      sorting_weight: 1
     on_press:
-      then:
-      - light.turn_on: 
+      - script.execute:
+          id: feed_portions
+          portions: 1
+          counted: true
+  - platform: template
+    id: test_feed
+    name: "Test feed"
+    icon: "mdi:test-tube"
+    web_server:
+      sorting_group_id: grp_feeding
+      sorting_weight: 2
+    on_press:
+      - script.execute:
+          id: feed_portions
+          portions: 1
+          counted: false
+  - platform: restart
+    name: "Restart"
+    web_server:
+      sorting_group_id: grp_diag
+
+script:
+  # Dispense `portions` portions, one after the other. Queued, so presses or
+  # slots that arrive while the motor is running wait their turn instead of
+  # resetting the motor position mid-move.
+  - id: feed_portions
+    mode: queued
+    max_runs: 10
+    parameters:
+      portions: int
+      counted: bool
+    then:
+      - light.turn_on:
           id: status_led
           effect: "Fast Pulse"
-      - stepper.report_position:
-          id: feeder_motor
-          position: 0
-      - stepper.set_target:
-          id: feeder_motor
-          target: -500 # Ensure no kibble is stuck
-      - delay: 2000ms
-      - stepper.set_target:
-          id: feeder_motor
-          target: !lambda return id(stepper_steps) * id(stepper_micro_steps) * id(stepper_gear_ratio) / 4 / 2; # Quarter turn, divided in 2 again to feed smaller portions
-      - number.increment: portions_today
-      - number.decrement: kibble_stock
-      - text_sensor.template.publish:
-          id: last_fed
-          state: !lambda return id(sntp_time).now().strftime("%Y-%m-%d %H:%M").c_str();
-      - delay: 3000ms
-      - light.turn_on: 
-          id: status_led
-          effect: "Asymmetrical Pulse"
+      - repeat:
+          count: !lambda return portions;
+          then:
+            - stepper.report_position:
+                id: feeder_motor
+                position: 0
+            # Reverse first so no kibble is stuck
+            - stepper.set_target:
+                id: feeder_motor
+                target: -500
+            - wait_until:
+                condition:
+                  lambda: return id(feeder_motor).has_reached_target();
+                timeout: 5s
+            - delay: 1s
+            # Quarter turn, halved again for smaller portions
+            - stepper.set_target:
+                id: feeder_motor
+                target: !lambda return (int) (${motor_steps} * ${micro_steps} * ${gear_ratio} / 4.0f / 2.0f);
+            - wait_until:
+                condition:
+                  lambda: return id(feeder_motor).has_reached_target();
+                timeout: 10s
+            - if:
+                condition:
+                  lambda: return counted;
+                then:
+                  - lambda: id(portions_fed_today) += 1;
+                  - component.update: portions_today
+                  - number.set:
+                      id: kibble_stock
+                      value: !lambda return std::max(0.0f, id(kibble_stock).state - (float) ${portion_grams});
+                  - lambda: |-
+                      auto now = id(sntp_time).now();
+                      if (now.is_valid()) id(last_fed_ts) = now.timestamp;
+                  - script.execute: publish_last_fed
+            - delay: 1s     # let the kibble settle between portions
+      - script.execute: set_idle_led
+
+  - id: set_idle_led
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: kibble_low
+          then:
+            - light.turn_on:
+                id: status_led
+                effect: "Low Kibble Blink"
+          else:
+            - light.turn_on:
+                id: status_led
+                effect: "Asymmetrical Pulse"
+
+  - id: publish_last_fed
+    then:
+      - lambda: |-
+          if (id(last_fed_ts) == 0) return;
+          auto t = ESPTime::from_epoch_local(id(last_fed_ts));
+          id(last_fed).publish_state(t.strftime("%Y-%m-%d %H:%M"));
 
 # === Schedule ===
 time:
   - platform: sntp
     id: sntp_time
     timezone: Europe/Brussels
+    # Gateway last: on a future IoT VLAN without internet NTP the router
+    # can still provide time (schedules only fire with a valid clock).
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - !secret home_gateway
+    on_time_sync:
+      - script.execute: publish_last_fed
     on_time:
       # Midnight
       - seconds: 0
         minutes: 0
         hours: 0
         then:
-          - number.set:
-              id: portions_today
-              value: 0
+          - lambda: id(portions_fed_today) = 0;
+          - component.update: portions_today
           - logger.log: "Midnight, reset daily feeding counter"
 
-      # Weekdays
-      - seconds: 0
-        hours: 7
-        minutes: 15
-        days_of_week: MON-FRI
-        then:
-          - button.press: feed
-          - delay: 6000ms
-          - button.press: feed
-      - seconds: 0
-        hours: 11
-        minutes: 30
-        days_of_week: MON-FRI
-        then:
-          - button.press: feed
-      - seconds: 0
-        hours: 15
-        minutes: 30
-        days_of_week: MON-FRI
-        then:
-          - button.press: feed
-      - seconds: 0
-        hours: 19
-        minutes: 00
-        days_of_week: MON-FRI
-        then:
-          - button.press: feed
-      - seconds: 0
-        hours: 23
-        minutes: 00
-        days_of_week: MON-FRI
-        then:
-          - button.press: feed
-          - delay: 6000ms
-          - button.press: feed
-
-      # Weekends
-      - seconds: 0
-        hours: 8
-        minutes: 30
-        days_of_week: SAT,SUN
-        then:
-          - button.press: feed
-          - delay: 6000ms
-          - button.press: feed
-      - seconds: 0
-        hours: 13
-        minutes: 00
-        days_of_week: SAT,SUN
-        then:
-          - button.press: feed
-      - seconds: 0
-        hours: 16
-        minutes: 30
-        days_of_week: SAT,SUN
-        then:
-          - button.press: feed
-      - seconds: 0
-        hours: 19
-        minutes: 30
-        days_of_week: SAT,SUN
-        then:
-          - button.press: feed
-      - seconds: 0
-        hours: 23
-        minutes: 30
-        days_of_week: SAT,SUN
-        then:
-          - button.press: feed
-          - delay: 6000ms
-          - button.press: feed
+# Editable slots (switch + time + portions). Defaults = the plan in use (7 portions/day).
+packages:
+  wd1: !include {file: packages/schedule_slot.yaml, vars: {slot_id: wd1, slot_name: "Weekday 1", default_time: "07:15:00", default_portions: 2, days_condition: "${weekday}", group: grp_weekday, weight: 1, toggle_weight: 11}}
+  wd2: !include {file: packages/schedule_slot.yaml, vars: {slot_id: wd2, slot_name: "Weekday 2", default_time: "11:30:00", default_portions: 2, days_condition: "${weekday}", group: grp_weekday, weight: 2, toggle_weight: 12}}
+  wd3: !include {file: packages/schedule_slot.yaml, vars: {slot_id: wd3, slot_name: "Weekday 3", default_time: "15:30:00", default_portions: 1, days_condition: "${weekday}", group: grp_weekday, weight: 3, toggle_weight: 13}}
+  wd4: !include {file: packages/schedule_slot.yaml, vars: {slot_id: wd4, slot_name: "Weekday 4", default_time: "19:00:00", default_portions: 1, days_condition: "${weekday}", group: grp_weekday, weight: 4, toggle_weight: 14}}
+  wd5: !include {file: packages/schedule_slot.yaml, vars: {slot_id: wd5, slot_name: "Weekday 5", default_time: "23:00:00", default_portions: 1, days_condition: "${weekday}", group: grp_weekday, weight: 5, toggle_weight: 15}}
+  we1: !include {file: packages/schedule_slot.yaml, vars: {slot_id: we1, slot_name: "Weekend 1", default_time: "08:30:00", default_portions: 2, days_condition: "${weekend}", group: grp_weekend, weight: 1, toggle_weight: 21}}
+  we2: !include {file: packages/schedule_slot.yaml, vars: {slot_id: we2, slot_name: "Weekend 2", default_time: "11:30:00", default_portions: 2, days_condition: "${weekend}", group: grp_weekend, weight: 2, toggle_weight: 22}}
+  we3: !include {file: packages/schedule_slot.yaml, vars: {slot_id: we3, slot_name: "Weekend 3", default_time: "15:30:00", default_portions: 1, days_condition: "${weekend}", group: grp_weekend, weight: 3, toggle_weight: 23}}
+  we4: !include {file: packages/schedule_slot.yaml, vars: {slot_id: we4, slot_name: "Weekend 4", default_time: "19:00:00", default_portions: 1, days_condition: "${weekend}", group: grp_weekend, weight: 4, toggle_weight: 24}}
+  we5: !include {file: packages/schedule_slot.yaml, vars: {slot_id: we5, slot_name: "Weekend 5", default_time: "23:00:00", default_portions: 1, days_condition: "${weekend}", group: grp_weekend, weight: 5, toggle_weight: 25}}
